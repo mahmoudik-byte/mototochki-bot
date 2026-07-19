@@ -444,10 +444,11 @@ async def stats(m: Message):
 @dp.message(F.text == BTN_MARK)
 async def mark_menu(m: Message):
     modes[m.chat.id] = "mark"
-    arm_geo(m.chat.id)
+    disarm_geo(m.chat.id)
     await home(m, "Отмечаешь место. Как задать точку? ↓\n\n"
                   "📍 <b>Я тут сейчас</b> — координаты с телефона.\n"
-                  "🗺 <b>Выбрать на карте</b> — если стоишь не там или вспомнил дома.")
+                  "🗺 <b>Выбрать на карте</b> — если стоишь не там или вспомнил дома.\n\n"
+                  "Передумал — жми <b>← Назад</b>.")
 
 
 @dp.message(F.text == BTN_PHOTOG)
@@ -455,10 +456,11 @@ async def photog_menu(m: Message):
     if live_presence(m.chat.id):
         return await start(m)
     modes[m.chat.id] = "shoot"
-    arm_geo(m.chat.id)
+    disarm_geo(m.chat.id)
     await home(m, "На карту как фотограф. Где ты? ↓\n\n"
                   "📷 <b>Снимаю тут сейчас</b> — координаты с телефона.\n"
-                  "🗺 <b>Выбрать на карте</b> — если отмечаешь заранее.")
+                  "🗺 <b>Выбрать на карте</b> — если отмечаешь заранее.\n\n"
+                  "Передумал — жми <b>← Назад</b>.")
 
 
 @dp.message(F.text == BTN_PICK)
