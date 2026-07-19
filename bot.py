@@ -164,6 +164,66 @@ def sb_count(table: str, **filters) -> int:
     return int(rng.split("/")[-1]) if "/" in rng else 0
 
 
+# ── Вход в приложение через Telegram ──────────────────────────────────
+# Человек жмёт в приложении «Войти через Telegram» → попадает сюда по ссылке
+# t.me/mototo4ki_bot?start=auth_КОД. Telegram гарантирует боту, кто это.
+# Бот берёт у Supabase одноразовый «пропуск» и кладёт его в login_tokens —
+# приложение забирает пропуск по своему КОДу и входит.
+
+AUTH = f"{SB_URL}/auth/v1"
+
+
+def tg_email(uid: int) -> str:
+    # у каждого телеграм-аккаунта свой стабильный синтетический «логин»
+    return f"tg{uid}@tg.mototochki.ru"
+
+
+def ensure_auth_user(uid: int, nick: str) -> None:
+    """Заводит аккаунт входа для телеграм-id (если ещё нет).
+    telegram_id и ник кладём в метаданные — триггер профиля их подхватит."""
+    r = httpx.post(f"{AUTH}/admin/users", headers=HEAD, timeout=15, json={
+        "email": tg_email(uid),
+        "email_confirm": True,
+        "user_metadata": {"telegram_id": uid, "nick": nick},
+    })
+    # 200/201 — создан; 422 — уже существует. Оба варианта нас устраивают.
+    if r.status_code not in (200, 201, 422):
+        r.raise_for_status()
+
+
+def make_login_token(uid: int):
+    """Просит у Supabase одноразовый пропуск (token_hash) для этого аккаунта."""
+    r = httpx.post(f"{AUTH}/admin/generate_link", headers=HEAD, timeout=15, json={
+        "type": "magiclink",
+        "email": tg_email(uid),
+    })
+    r.raise_for_status()
+    d = r.json()
+    return d.get("hashed_token") or d.get("properties", {}).get("hashed_token")
+
+
+async def handle_web_login(m: "Message", code: str) -> None:
+    code = (code or "").strip()
+    if not (6 <= len(code) <= 64) or not code.replace("-", "").isalnum():
+        return await m.answer(
+            "Ссылка входа кривая. Открой приложение и нажми «Войти» заново.")
+    uid = m.from_user.id
+    nick = m.from_user.username or m.from_user.first_name or f"user{uid}"
+    try:
+        ensure_auth_user(uid, nick)
+        token = make_login_token(uid)
+        if not token:
+            raise RuntimeError("Supabase не вернул token_hash")
+        sb_upsert("login_tokens", {
+            "code": code, "token_hash": token,
+            "telegram_id": uid, "nick": nick,
+        }, on_conflict="code")
+    except Exception as e:
+        print(f"[login] ошибка входа для {uid}: {e}")
+        return await m.answer("Не получилось войти. Попробуй ещё раз через пару секунд.")
+    await m.answer("✅ Готово! Вернись в приложение — вход выполнен.")
+
+
 # ── операции ──────────────────────────────────────────────────────────
 
 def meters(lat1, lon1, lat2, lon2) -> float:
@@ -290,7 +350,7 @@ if "--export" in sys.argv:
 
 import asyncio  # noqa: E402
 from aiogram import Bot, Dispatcher, F  # noqa: E402
-from aiogram.filters import Command, CommandStart  # noqa: E402
+from aiogram.filters import Command, CommandObject, CommandStart  # noqa: E402
 from aiogram.types import (  # noqa: E402
     CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup,
     KeyboardButton, Message, ReplyKeyboardMarkup,
@@ -405,7 +465,10 @@ def disarm_geo(user_id: int):
 
 
 @dp.message(CommandStart())
-async def start(m: Message):
+async def start(m: Message, command: CommandObject | None = None):
+    payload = command.args if command else None
+    if payload and payload.startswith("auth_"):
+        return await handle_web_login(m, payload[len("auth_"):])
     modes.pop(m.chat.id, None)
     disarm_geo(m.chat.id)
     p = live_presence(m.chat.id)
