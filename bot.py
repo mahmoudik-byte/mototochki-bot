@@ -202,6 +202,23 @@ def make_login_token(uid: int):
     return d.get("hashed_token") or d.get("properties", {}).get("hashed_token")
 
 
+async def fetch_avatar_url(m: "Message"):
+    """Тянет аватарку из Telegram, кладёт в Storage, возвращает URL (или None)."""
+    uid = m.from_user.id
+    try:
+        photos = await m.bot.get_user_profile_photos(uid, limit=1)
+        if not photos.total_count:
+            return None
+        biggest = photos.photos[0][-1]           # самый большой размер
+        f = await m.bot.get_file(biggest.file_id)
+        buf = await m.bot.download_file(f.file_path)
+        data = buf.read() if hasattr(buf, "read") else bytes(buf)
+        return sb_storage_upload(f"avatars/{uid}.jpg", data, "image/jpeg")
+    except Exception as e:
+        print(f"[avatar] {uid}: {e}")
+        return None
+
+
 async def handle_web_login(m: "Message", code: str) -> None:
     code = (code or "").strip()
     if not (6 <= len(code) <= 64) or not code.replace("-", "").isalnum():
@@ -221,6 +238,13 @@ async def handle_web_login(m: "Message", code: str) -> None:
     except Exception as e:
         print(f"[login] ошибка входа для {uid}: {e}")
         return await m.answer("Не получилось войти. Попробуй ещё раз через пару секунд.")
+    # аватарка — best-effort, вход не блокирует
+    av = await fetch_avatar_url(m)
+    if av:
+        try:
+            sb_update("profiles", {"telegram_id": uid}, {"avatar_url": av})
+        except Exception as e:
+            print(f"[avatar] update {uid}: {e}")
     await m.answer("✅ Готово! Вернись в приложение — вход выполнен.")
 
 
