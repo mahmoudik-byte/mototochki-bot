@@ -168,6 +168,83 @@ def sb_count(table: str, **filters) -> int:
     return int(rng.split("/")[-1]) if "/" in rng else 0
 
 
+# ── Фоновые пуши (Web Push, VAPID) ────────────────────────────────────
+# Приватный VAPID-ключ и subject берём из secrets.txt (необязательные строки):
+#   VAPID_PRIVATE=<приватный ключ, пара к публичному в index.html>
+#   VAPID_SUBJECT=mailto:admin@mototochki.ru
+# Если VAPID_PRIVATE не задан — пуши просто молча выключены.
+
+def read_vapid() -> tuple[str | None, str]:
+    priv = subj = None
+    if SECRETS_FILE.exists():
+        for line in SECRETS_FILE.read_text().splitlines():
+            line = line.strip()
+            if line.startswith("VAPID_PRIVATE="):
+                priv = line.split("=", 1)[1].strip()
+            elif line.startswith("VAPID_SUBJECT="):
+                subj = line.split("=", 1)[1].strip()
+    return (priv or None), (subj or "mailto:admin@mototochki.ru")
+
+
+VAPID_PRIVATE, VAPID_SUBJECT = read_vapid()
+_pywebpush_ok = None
+
+
+def _ensure_pywebpush() -> bool:
+    global _pywebpush_ok
+    if _pywebpush_ok is not None:
+        return _pywebpush_ok
+    try:
+        import pywebpush  # noqa: F401
+        _pywebpush_ok = True
+    except ImportError:
+        try:
+            subprocess.check_call(
+                [sys.executable, "-m", "pip", "install", "--quiet", "pywebpush"])
+            import pywebpush  # noqa: F401
+            _pywebpush_ok = True
+        except Exception as e:
+            print(f"pywebpush не поставился ({e}); пуши выключены")
+            _pywebpush_ok = False
+    return _pywebpush_ok
+
+
+def send_push(title: str, body: str = "", url: str = "/", tag: str | None = None):
+    """Шлёт web-push всем подписанным устройствам. Тихо выходит, если не настроено."""
+    if not VAPID_PRIVATE or not _ensure_pywebpush():
+        return
+    from pywebpush import webpush, WebPushException
+    try:
+        subs = sb_select("push_subscriptions", select="endpoint,p256dh,auth")
+    except Exception as e:
+        print(f"send_push select: {e}")
+        return
+    payload = json.dumps({"title": title, "body": body, "url": url, "tag": tag},
+                         ensure_ascii=False)
+    sent = dead = 0
+    for s in subs:
+        info = {"endpoint": s["endpoint"],
+                "keys": {"p256dh": s["p256dh"], "auth": s["auth"]}}
+        try:
+            webpush(subscription_info=info, data=payload,
+                    vapid_private_key=VAPID_PRIVATE,
+                    vapid_claims={"sub": VAPID_SUBJECT})
+            sent += 1
+        except WebPushException as e:
+            code = getattr(getattr(e, "response", None), "status_code", None)
+            if code in (404, 410):   # устройство отписалось — чистим
+                try:
+                    httpx.delete(f"{REST}/push_subscriptions", headers=HEAD,
+                                 params={"endpoint": f"eq.{s['endpoint']}"}, timeout=15)
+                    dead += 1
+                except Exception:
+                    pass
+        except Exception as e:
+            print(f"send_push one: {e}")
+    if sent or dead:
+        print(f"send_push: отправлено {sent}, мёртвых убрано {dead}")
+
+
 # ── Вход в приложение через Telegram ──────────────────────────────────
 # Человек жмёт в приложении «Войти через Telegram» → попадает сюда по ссылке
 # t.me/mototo4ki_bot?start=auth_КОД. Telegram гарантирует боту, кто это.
@@ -752,6 +829,7 @@ def dtp_import():
              for mo in re.finditer(rf'data-post="{DTP_CHANNEL}/(\d+)"', page)]
     now = datetime.now(timezone.utc)
     added = 0
+    last_title = None
     for i, (pos, msg_id) in enumerate(marks):
         if msg_id in have:
             continue
@@ -780,10 +858,17 @@ def dtp_import():
                 "src": DTP_CHANNEL, "src_msg_id": msg_id,
             })
             added += 1
+            last_title = title
         except Exception as e:
             print(f"dtp_import insert {msg_id}: {e}")
     if added:
         print(f"dtp_import: +{added} ДТП с карты канала")
+        try:
+            body = last_title if added == 1 else f"Новых происшествий: {added}"
+            send_push("🚨 ДТП на карте", body or "Открой карту — рядом происшествие",
+                      url="/", tag="dtp")
+        except Exception as e:
+            print(f"dtp_import push: {e}")
 
 
 async def dtp_import_loop(bot):
