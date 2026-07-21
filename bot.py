@@ -209,13 +209,18 @@ def _ensure_pywebpush() -> bool:
     return _pywebpush_ok
 
 
-def send_push(title: str, body: str = "", url: str = "/", tag: str | None = None):
-    """Шлёт web-push всем подписанным устройствам. Тихо выходит, если не настроено."""
+def send_push(title: str, body: str = "", url: str = "/", tag: str | None = None,
+              user_id: str | None = None):
+    """Шлёт web-push. user_id — только этому пользователю; иначе всем. Тихо выходит, если не настроено."""
     if not VAPID_PRIVATE or not _ensure_pywebpush():
         return
     from pywebpush import webpush, WebPushException
     try:
-        subs = sb_select("push_subscriptions", select="endpoint,p256dh,auth")
+        if user_id:
+            subs = sb_select("push_subscriptions", select="endpoint,p256dh,auth",
+                             user_id=f"eq.{user_id}")
+        else:
+            subs = sb_select("push_subscriptions", select="endpoint,p256dh,auth")
     except Exception as e:
         print(f"send_push select: {e}")
         return
@@ -880,6 +885,55 @@ async def dtp_import_loop(bot):
         await asyncio.sleep(600)   # раз в 10 минут
 
 
+# ── Пуш о новом личном сообщении ──────────────────────────────────────
+_chat_cursor = None   # ISO created_at последнего обработанного сообщения
+
+def chat_push_tick():
+    """Шлёт пуш получателю при новом личном (dm) сообщении."""
+    global _chat_cursor
+    if not VAPID_PRIVATE:
+        return
+    if _chat_cursor is None:   # первый заход — базлайн, старое не рассылаем
+        rows = sb_select("chat_messages", select="created_at",
+                         order="created_at.desc", limit="1")
+        _chat_cursor = rows[0]["created_at"] if rows else "1970-01-01T00:00:00+00:00"
+        return
+    msgs = sb_select("chat_messages", select="channel_id,author_id,text,created_at",
+                     created_at=f"gt.{_chat_cursor}", order="created_at.asc")
+    if not msgs:
+        return
+    _chat_cursor = msgs[-1]["created_at"]
+    ch_ids = list({m["channel_id"] for m in msgs})
+    chans = {c["id"]: c for c in sb_select(
+        "chat_channels", select="id,kind,dm_a,dm_b",
+        id="in.(" + ",".join(ch_ids) + ")")}
+    author_ids = list({m["author_id"] for m in msgs})
+    nicks = {}
+    if author_ids:
+        for p in sb_select("profiles", select="id,nick,display_name",
+                           id="in.(" + ",".join(author_ids) + ")"):
+            nicks[p["id"]] = p.get("display_name") or p.get("nick") or "Кто-то"
+    for m in msgs:
+        c = chans.get(m["channel_id"])
+        if not c or c.get("kind") != "dm":
+            continue   # пушим только личку
+        author = m["author_id"]
+        recipient = c["dm_b"] if c["dm_a"] == author else c["dm_a"]
+        if not recipient:
+            continue
+        send_push(f"✉️ {nicks.get(author, 'Личное сообщение')}",
+                  (m.get("text") or "")[:120], url="/", tag="dm", user_id=recipient)
+
+
+async def chat_push_loop(bot):
+    while True:
+        try:
+            await asyncio.to_thread(chat_push_tick)
+        except Exception as e:
+            print(f"chat_push_loop: {e}")
+        await asyncio.sleep(20)   # раз в 20 секунд
+
+
 async def expiry_loop(bot):
     while True:
         try:
@@ -1122,6 +1176,7 @@ async def main():
     asyncio.create_task(expiry_loop(bot))
     asyncio.create_task(geo_watchdog(bot))
     asyncio.create_task(dtp_import_loop(bot))
+    asyncio.create_task(chat_push_loop(bot))
     print(f"@{me.username} слушает, база в облаке. Ctrl+C — стоп.\n")
     await dp.start_polling(bot)
 
