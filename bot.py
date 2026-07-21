@@ -890,13 +890,23 @@ def dtp_import(backfill=False, max_pages=1):
     total = 0
     last_title = None
     before = None
+    reached_end = False
     for _pg in range(max(1, max_pages)):
         url = base + (f"?before={before}" if before else "")
         try:
             page = _dtp_page(url)
         except Exception as e:
-            print(f"dtp fetch: {e}")
-            break
+            if backfill:                # на бэкфилле — подождём и попробуем ещё раз
+                print(f"dtp fetch retry ({e})")
+                time.sleep(5)
+                try:
+                    page = _dtp_page(url)
+                except Exception as e2:
+                    print(f"dtp fetch: {e2}")
+                    break
+            else:
+                print(f"dtp fetch: {e}")
+                break
         if _pg == 0:                    # первая (свежая) страница — обновим карточку канала
             try:
                 ctitle, cav = _dtp_channel_info(page)
@@ -912,12 +922,19 @@ def dtp_import(backfill=False, max_pages=1):
         if lt:
             last_title = lt
         if not seen or min_id is None:
-            break                       # постов больше нет — конец истории
+            reached_end = True
+            break                       # постов больше нет — начало канала
         before = min_id
         if not backfill:
             break                       # обычный режим — только первая (свежая) страница
+        if (_pg + 1) % 50 == 0:
+            print(f"dtp backfill: {_pg + 1} стр, +{total} ДТП, дошли до msg {before}")
+        time.sleep(0.4)                 # щадим Telegram
+    if backfill and reached_end:
+        _dtp_mark_backfilled()
+        print(f"dtp backfill: ГОТОВО — вся история пройдена, всего +{total} ДТП")
     if total:
-        print(f"dtp_import: +{total} ДТП из канала{' (бэкфилл истории)' if backfill else ''}")
+        print(f"dtp_import: +{total} ДТП из канала{' (бэкфилл)' if backfill else ''}")
         if not backfill:                # на бэкфилле пушами не спамим
             try:
                 body = last_title if total == 1 else f"Новых происшествий: {total}"
@@ -927,11 +944,33 @@ def dtp_import(backfill=False, max_pages=1):
                 print(f"dtp push: {e}")
 
 
-async def dtp_import_loop(bot):
-    try:                                # первый прогон — бэкфилл всей доступной истории канала
-        await asyncio.to_thread(dtp_import, True, 80)
+def _dtp_backfilled():
+    try:
+        rows = sb_select("tg_channels", select="backfilled_at", slug=f"eq.{DTP_CHANNEL}")
+        return bool(rows and rows[0].get("backfilled_at"))
+    except Exception:
+        return False
+
+
+def _dtp_mark_backfilled():
+    try:
+        sb_upsert("tg_channels", {
+            "slug": DTP_CHANNEL,
+            "backfilled_at": datetime.now(timezone.utc).isoformat(),
+        }, on_conflict="slug")
     except Exception as e:
-        print(f"dtp backfill: {e}")
+        print(f"dtp mark backfilled: {e}")
+
+
+async def dtp_import_loop(bot):
+    async def _backfill_once():         # разово тянем ВСЮ историю (в фоне, не блокирует регулярный импорт)
+        try:
+            if not await asyncio.to_thread(_dtp_backfilled):
+                print("dtp backfill: старт — тянем всю историю канала (надолго, в фоне)")
+                await asyncio.to_thread(dtp_import, True, 3000)
+        except Exception as e:
+            print(f"dtp backfill: {e}")
+    asyncio.create_task(_backfill_once())
     while True:
         try:
             await asyncio.to_thread(dtp_import, False, 1)
