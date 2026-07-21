@@ -979,6 +979,112 @@ async def dtp_import_loop(bot):
         await asyncio.sleep(600)   # раз в 10 минут
 
 
+# ── Джимхана из телеграм-каналов (авто-события, живут 2 недели) ────────
+GYM_SOURCES = [
+    {"slug": "L73moto_info", "discipline": "l73",      "keyword": None},        # все посты
+    {"slug": "formulax_tc",  "discipline": "formulax", "keyword": "джимхан"},   # только про сбор джимханы
+]
+
+
+def _gym_link(block):
+    """Первая внешняя ссылка из поста (не telegram)."""
+    for mo in re.finditer(r'href="(https?://[^"]+)"', block):
+        u = _html.unescape(mo.group(1))
+        if "t.me/" not in u and "telegram." not in u:
+            return u[:300]
+    return None
+
+
+def gym_import_channel(slug, discipline, keyword=None):
+    """Свежие (за 2 недели) посты канала → gymkhana_events. Дедуп + автоудаление по expires_at."""
+    try:
+        have = {row.get("src_msg_id") for row in
+                sb_select("gymkhana_events", select="src_msg_id", src=f"eq.{slug}")}
+    except Exception as e:
+        print(f"gym have {slug}: {e}"); return
+    try:
+        page = _dtp_page(f"https://t.me/s/{slug}")
+    except Exception as e:
+        print(f"gym fetch {slug}: {e}"); return
+    try:                                    # аватар + имя канала (как у ДТП)
+        ctitle, cav = _dtp_channel_info(page)
+        if ctitle or cav:
+            sb_upsert("tg_channels", {"slug": slug, "title": ctitle, "avatar_url": cav,
+                                      "updated_at": datetime.now(timezone.utc).isoformat()},
+                      on_conflict="slug")
+    except Exception as e:
+        print(f"gym channel {slug}: {e}")
+    marks = [(mo.start(), int(mo.group(1)))
+             for mo in re.finditer(rf'data-post="{slug}/(\d+)"', page)]
+    now = datetime.now(timezone.utc)
+    added = 0
+    for i, (pos, msg_id) in enumerate(marks):
+        if msg_id in have:
+            continue
+        block = page[pos:(marks[i + 1][0] if i + 1 < len(marks) else len(page))]
+        text = _dtp_text(block)
+        if not text:
+            continue
+        if keyword and keyword.lower() not in text.lower():
+            continue                        # берём только про сбор джимханы
+        dt = re.search(r'datetime="([^"]+)"', block)
+        try:
+            posted = datetime.fromisoformat(dt.group(1)) if dt else now
+        except Exception:
+            posted = now
+        if posted.tzinfo is None:
+            posted = posted.replace(tzinfo=timezone.utc)
+        if now - posted > timedelta(days=14):
+            continue                        # старше 2 недель не берём
+        title = (text.split("\n", 1)[0] or "Джимхана").strip()[:80] or "Джимхана"
+        try:
+            sb_insert("gymkhana_events", {
+                "id": str(uuid.uuid4()),
+                "title": title,
+                "description": (text[:600] or None),
+                "discipline": discipline,
+                "link_url": _gym_link(block),
+                "is_public": True, "is_listed": True,
+                "start_at": posted.isoformat(),
+                "expires_at": (posted + timedelta(days=14)).isoformat(),
+                "src": slug, "src_msg_id": msg_id,
+            })
+            added += 1
+        except Exception as e:
+            print(f"gym insert {slug}/{msg_id}: {e}")
+    if added:
+        print(f"gym_import {slug}: +{added} (ветка {discipline})")
+
+
+def gym_cleanup():
+    """Удаляет протухшие (>2 недель) спарсенные события джимханы."""
+    now = datetime.now(timezone.utc).isoformat()
+    for s in GYM_SOURCES:
+        try:
+            httpx.delete(f"{REST}/gymkhana_events", headers=HEAD, timeout=15,
+                         params={"src": f"eq.{s['slug']}", "expires_at": f"lt.{now}"})
+        except Exception as e:
+            print(f"gym cleanup {s['slug']}: {e}")
+
+
+def gym_import_all():
+    for s in GYM_SOURCES:
+        try:
+            gym_import_channel(s["slug"], s["discipline"], s.get("keyword"))
+        except Exception as e:
+            print(f"gym_import {s['slug']}: {e}")
+    gym_cleanup()
+
+
+async def gym_import_loop(bot):
+    while True:
+        try:
+            await asyncio.to_thread(gym_import_all)
+        except Exception as e:
+            print(f"gym_import_loop: {e}")
+        await asyncio.sleep(600)   # раз в 10 минут
+
+
 # ── Пуш о новом личном сообщении ──────────────────────────────────────
 _chat_cursor = None   # ISO created_at последнего обработанного сообщения
 
@@ -1270,6 +1376,7 @@ async def main():
     asyncio.create_task(expiry_loop(bot))
     asyncio.create_task(geo_watchdog(bot))
     asyncio.create_task(dtp_import_loop(bot))
+    asyncio.create_task(gym_import_loop(bot))
     asyncio.create_task(chat_push_loop(bot))
     print(f"@{me.username} слушает, база в облаке. Ctrl+C — стоп.\n")
     await dp.start_polling(bot)
