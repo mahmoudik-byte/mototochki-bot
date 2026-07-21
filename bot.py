@@ -818,29 +818,29 @@ def _dtp_text(block: str) -> str:
     return re.sub(r"\n{3,}", "\n\n", t).strip()
 
 
-def dtp_import():
-    """Тянет свежие ДТП (за 24 ч) из веб-ленты канала и пишет новые в таблицу dtp."""
-    try:
-        r = httpx.get(f"https://t.me/s/{DTP_CHANNEL}", timeout=20,
-                      headers={"User-Agent": "Mozilla/5.0"})
-        r.raise_for_status()
-        page = r.text
-    except Exception as e:
-        print(f"dtp_import fetch: {e}")
-        return
-    have = {row.get("src_msg_id") for row in
-            sb_select("dtp", select="src_msg_id", src=f"eq.{DTP_CHANNEL}")}
+def _dtp_page(url):
+    r = httpx.get(url, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
+    r.raise_for_status()
+    return r.text
+
+
+def _dtp_parse(page, have):
+    """Вставляет новые ДТП с координатами со страницы. → (added, min_msg_id, marks, last_title)."""
     marks = [(mo.start(), int(mo.group(1)))
              for mo in re.finditer(rf'data-post="{DTP_CHANNEL}/(\d+)"', page)]
     now = datetime.now(timezone.utc)
     added = 0
     last_title = None
+    min_id = None
     for i, (pos, msg_id) in enumerate(marks):
+        if min_id is None or msg_id < min_id:
+            min_id = msg_id
         if msg_id in have:
             continue
         block = page[pos:(marks[i + 1][0] if i + 1 < len(marks) else len(page))]
         coords = _dtp_coords(block)
         if not coords:
+            have.add(msg_id)
             continue
         dt = re.search(r'datetime="([^"]+)"', block)
         try:
@@ -849,8 +849,6 @@ def dtp_import():
             posted = now
         if posted.tzinfo is None:
             posted = posted.replace(tzinfo=timezone.utc)
-        if now - posted > timedelta(hours=24):
-            continue
         text = _dtp_text(block)
         title = (text.split("\n", 1)[0] or "ДТП").strip()[:80] or "ДТП"
         try:
@@ -862,24 +860,62 @@ def dtp_import():
                 "expires_at": (posted + timedelta(hours=24)).isoformat(),
                 "src": DTP_CHANNEL, "src_msg_id": msg_id,
             })
+            have.add(msg_id)
             added += 1
             last_title = title
         except Exception as e:
-            print(f"dtp_import insert {msg_id}: {e}")
-    if added:
-        print(f"dtp_import: +{added} ДТП с карты канала")
+            print(f"dtp insert {msg_id}: {e}")
+    return added, min_id, len(marks), last_title
+
+
+def dtp_import(backfill=False, max_pages=1):
+    """Импорт ДТП из веб-ленты канала. Без фильтра по времени — тянем всё.
+       backfill=True — идём вглубь истории по ?before= (до max_pages страниц)."""
+    try:
+        have = {row.get("src_msg_id") for row in
+                sb_select("dtp", select="src_msg_id", src=f"eq.{DTP_CHANNEL}")}
+    except Exception as e:
+        print(f"dtp have: {e}")
+        return
+    base = f"https://t.me/s/{DTP_CHANNEL}"
+    total = 0
+    last_title = None
+    before = None
+    for _pg in range(max(1, max_pages)):
+        url = base + (f"?before={before}" if before else "")
         try:
-            body = last_title if added == 1 else f"Новых происшествий: {added}"
-            send_push("🚨 ДТП на карте", body or "Открой карту — рядом происшествие",
-                      url="/", tag="dtp")
+            page = _dtp_page(url)
         except Exception as e:
-            print(f"dtp_import push: {e}")
+            print(f"dtp fetch: {e}")
+            break
+        added, min_id, seen, lt = _dtp_parse(page, have)
+        total += added
+        if lt:
+            last_title = lt
+        if not seen or min_id is None:
+            break                       # постов больше нет — конец истории
+        before = min_id
+        if not backfill:
+            break                       # обычный режим — только первая (свежая) страница
+    if total:
+        print(f"dtp_import: +{total} ДТП из канала{' (бэкфилл истории)' if backfill else ''}")
+        if not backfill:                # на бэкфилле пушами не спамим
+            try:
+                body = last_title if total == 1 else f"Новых происшествий: {total}"
+                send_push("🚨 ДТП на карте", body or "Открой карту — рядом происшествие",
+                          url="/", tag="dtp")
+            except Exception as e:
+                print(f"dtp push: {e}")
 
 
 async def dtp_import_loop(bot):
+    try:                                # первый прогон — бэкфилл всей доступной истории канала
+        await asyncio.to_thread(dtp_import, True, 80)
+    except Exception as e:
+        print(f"dtp backfill: {e}")
     while True:
         try:
-            await asyncio.to_thread(dtp_import)
+            await asyncio.to_thread(dtp_import, False, 1)
         except Exception as e:
             print(f"dtp_import_loop: {e}")
         await asyncio.sleep(600)   # раз в 10 минут
