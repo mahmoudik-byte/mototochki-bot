@@ -824,6 +824,15 @@ def _dtp_page(url):
     return r.text
 
 
+def _dtp_channel_info(page):
+    """(title, avatar_url) канала из og-мета страницы t.me/s/<канал>."""
+    t = re.search(r'<meta property="og:title" content="([^"]*)"', page)
+    a = re.search(r'<meta property="og:image" content="([^"]*)"', page)
+    title = _html.unescape(t.group(1)).strip() if t else None
+    avatar = a.group(1) if a else None
+    return title, avatar
+
+
 def _dtp_parse(page, have):
     """Вставляет новые ДТП с координатами со страницы. → (added, min_msg_id, marks, last_title)."""
     marks = [(mo.start(), int(mo.group(1)))
@@ -888,6 +897,16 @@ def dtp_import(backfill=False, max_pages=1):
         except Exception as e:
             print(f"dtp fetch: {e}")
             break
+        if _pg == 0:                    # первая (свежая) страница — обновим карточку канала
+            try:
+                ctitle, cav = _dtp_channel_info(page)
+                if ctitle or cav:
+                    sb_upsert("tg_channels", {
+                        "slug": DTP_CHANNEL, "title": ctitle, "avatar_url": cav,
+                        "updated_at": datetime.now(timezone.utc).isoformat(),
+                    }, on_conflict="slug")
+            except Exception as e:
+                print(f"tg_channel upsert: {e}")
         added, min_id, seen, lt = _dtp_parse(page, have)
         total += added
         if lt:
