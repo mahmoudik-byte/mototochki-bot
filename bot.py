@@ -791,11 +791,11 @@ async def stay_more(c: CallbackQuery):
 
 def _dtp_coords(block: str):
     """(lat, lon) из карт-ссылок поста или None. Google: query=lat,lon; Яндекс: lon,lat."""
-    m = re.search(r"google\.[a-z.]+/maps[^\"'<> ]*?[?&]query=(-?\d+\.\d+)(?:,|%2C)(-?\d+\.\d+)", block)
+    m = re.search(r"google\.[a-z.]+/maps[^\"'<> ]*?[?&;](?:amp;)?query=(-?\d+\.\d+)(?:,|%2C)(-?\d+\.\d+)", block)
     if m:
         lat, lon = float(m.group(1)), float(m.group(2))
     else:
-        m = (re.search(r"yandex\.[a-z.]+/maps[^\"'<> ]*?(?:[?&](?:pt|ll)=|whatshere(?:%5B|\[)point(?:%5D|\])=)"
+        m = (re.search(r"yandex\.[a-z.]+/maps[^\"'<> ]*?(?:[?&;](?:amp;)?(?:pt|ll)=|whatshere(?:%5B|\[)point(?:%5D|\])=)"
                        r"(-?\d+\.\d+)(?:,|%2C)(-?\d+\.\d+)", block)
              or re.search(r"yandex\.[a-z.]+/maps[^\"'<> ]*?(\d{2}\.\d{4,})(?:,|%2C)(\d{2}\.\d{4,})", block))
         if not m:
